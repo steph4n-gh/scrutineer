@@ -2,11 +2,77 @@ package web
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
+
+	"golang.org/x/net/html"
 
 	"scrutineer/internal/db"
 	"scrutineer/internal/verification"
 )
+
+func TestFindingShowVerificationIdentifiesGradedRevision(t *testing.T) {
+	const (
+		commitA = "3091c393df64b9035f294197a208e5b7b3c53fa4"
+		commitB = "5228d9bee88300b32c53c5ef403f43564d57e7a0"
+	)
+	for _, tc := range []struct {
+		name   string
+		commit string
+		run    uint
+		want   string
+	}{
+		{"graded at A, scan resumed at B", commitA, 1, "fixed at 3091c393df64"},
+		{"legacy grade without provenance", "", 0, "fixed (commit not recorded)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, done := newTestServer(t)
+			defer done()
+			finding := seedFindingForForm(t, s)
+			scan := db.Scan{RepositoryID: finding.RepositoryID, FindingID: &finding.ID,
+				Kind: "skill", SkillName: verifySkillName, Status: db.ScanDone,
+				Commit: commitB, RunNumber: 2}
+			if err := s.DB.Create(&scan).Error; err != nil {
+				t.Fatal(err)
+			}
+			report := revisionFixedReport("The checked code rejects index 8.")
+			raw, err := json.Marshal(report)
+			if err != nil {
+				t.Fatal(err)
+			}
+			score := report.Score()
+			grade := db.FindingVerification{FindingID: finding.ID, ScanID: scan.ID,
+				Commit: tc.commit, RunNumber: tc.run, Status: report.Status, Score: &score, Report: string(raw)}
+			if err := s.DB.Create(&grade).Error; err != nil {
+				t.Fatal(err)
+			}
+
+			body := pageBody(t, s, fmt.Sprintf("/findings/%d", finding.ID))
+			doc, err := html.Parse(strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var text strings.Builder
+			walkHTML(doc, func(n *html.Node) {
+				if n.Type == html.TextNode {
+					text.WriteString(n.Data)
+					text.WriteByte(' ')
+				}
+			})
+			visible := strings.Join(strings.Fields(text.String()), " ")
+			if count := strings.Count(visible, tc.want); count != 2 {
+				t.Errorf("summary and history show %q %d times, want 2", tc.want, count)
+			}
+			if strings.Contains(visible, commitB[:12]) || strings.Contains(visible, "run 2") {
+				t.Error("verification display borrowed provenance from the resumed scan at B")
+			}
+			if tc.run > 0 && strings.Count(visible, "run 1") != 2 {
+				t.Error("summary and history do not identify the graded run")
+			}
+		})
+	}
+}
 
 func TestLoadFindingVerificationViewsToleratesUngradedRow(t *testing.T) {
 	s, done := newTestServer(t)

@@ -141,8 +141,9 @@
   <div>
     <dt class="text-muted-foreground font-semibold">Verification</dt>
     <dd>
-      <a href="/scans/{{.ScanID}}" class="hover:underline">{{.Status}}</a>
+      <a href="/scans/{{.ScanID}}" class="hover:underline">{{.Status}}</a>{{if .Commit}} at <code class="text-xs" title="{{.Commit}}">{{short .Commit}}</code>{{else}} (commit not recorded){{end}}
       <span class="badge-outline ml-1">{{.ScoreLabel}}</span>
+      {{if .RunNumber}}<span class="text-xs text-muted-foreground"> · run {{.RunNumber}}</span>{{end}}
     </dd>
   </div>
   {{end}}
@@ -410,7 +411,10 @@
           {{range .Verifications}}
             <tr class="align-top">
               <td><a href="/scans/{{.ScanID}}" class="font-medium hover:underline">#{{.ScanID}}</a></td>
-              <td><span class="badge-outline">{{.Status}}</span></td>
+              <td>
+                <span class="badge-outline">{{.Status}}</span>{{if .Commit}} at <code class="text-xs" title="{{.Commit}}">{{short .Commit}}</code>{{else}} (commit not recorded){{end}}
+                {{if .RunNumber}}<span class="text-xs text-muted-foreground"> · run {{.RunNumber}}</span>{{end}}
+              </td>
               <td><span class="badge-outline">{{.ScoreLabel}}</span></td>
               <td class="text-muted-foreground">{{.CreatedAt.Format "2006-01-02 15:04"}}</td>
               <td class="whitespace-normal">{{with .VerificationFeedback}}<pre class="whitespace-pre-wrap break-words font-sans">{{.}}</pre>{{else}}<span class="text-muted-foreground">-</span>{{end}}</td>
