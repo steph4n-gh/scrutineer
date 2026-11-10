@@ -881,6 +881,8 @@ func (w *Worker) startScan(scan *db.Scan) error {
 				"status":          db.ScanRunning,
 				"status_priority": db.StatusPriorityFor(db.ScanRunning),
 				"started_at":      &now,
+				"run_number":      gorm.Expr("COALESCE(run_number, 0) + 1"),
+				"commit":          "",
 				"log":             "",
 				errorColumn:       "",
 				"backend":         backend,
@@ -922,6 +924,12 @@ func (w *Worker) startScan(scan *db.Scan) error {
 		if sealed.RowsAffected > 0 {
 			scan.Recipe = recipe
 		}
+		var claimed db.Scan
+		if err := tx.Select("run_number").First(&claimed, scan.ID).Error; err != nil {
+			return err
+		}
+		scan.RunNumber = claimed.RunNumber
+		scan.Commit = ""
 		scan.Status = db.ScanRunning
 		scan.StatusPriority = db.StatusPriorityFor(db.ScanRunning)
 		scan.StartedAt = &now

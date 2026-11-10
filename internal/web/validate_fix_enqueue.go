@@ -185,13 +185,21 @@ func (s *Server) autoComputeFixValidation(scan *db.Scan) {
 		s.Log.Warn("fix-validation: load baseline findings", "scan", scan.ID, "baseline", baselineID, "err", err)
 		return
 	}
+	var observedIDs []uint
+	if err := s.DB.Model(&db.FindingObservation{}).
+		Where("scan_id = ?", scan.ID).
+		Where(map[string]any{"commit": scan.Commit}).
+		Pluck("finding_id", &observedIDs).Error; err != nil {
+		s.Log.Warn("fix-validation: load scan observations", "scan", scan.ID, "err", err)
+		return
+	}
 	var fixNew []db.Finding
-	if err := s.DB.Where("scan_id = ?", scan.ID).Find(&fixNew).Error; err != nil {
+	if err := s.DB.Where("scan_id = ? AND id IN ?", scan.ID, observedIDs).Find(&fixNew).Error; err != nil {
 		s.Log.Warn("fix-validation: load fix findings", "scan", scan.ID, "err", err)
 		return
 	}
 
-	report := buildFixValidationReport(*scan, baselineID, baseline, fixNew, s.fixValidationVerdicts(baseline, scan.Ref))
+	report := buildFixValidationReport(*scan, baselineID, baseline, fixNew, observedIDs, s.fixValidationVerdicts(baseline, scan.Ref, scan.Commit))
 	payload, err := json.Marshal(report)
 	if err != nil {
 		s.Log.Warn("fix-validation: marshal report", "scan", scan.ID, "err", err)
@@ -205,9 +213,11 @@ func (s *Server) autoComputeFixValidation(scan *db.Scan) {
 // fixValidationVerdicts collects, for each baseline finding that had a verify
 // run against the fix ref, that verify's reproduction-level verdict. Findings
 // with no verify-against-ref scan are omitted; one whose verify has not yet
-// finished is reported pending. One query (not one per finding) keeps the
-// not-found case quiet and cheap; the latest scan per finding wins.
-func (s *Server) fixValidationVerdicts(baseline []db.Finding, ref string) []fixValidationVerify {
+// finished is reported pending. The latest scan per finding wins, including
+// attempts with missing or rejected evidence. Completed verdicts require the
+// same known commit, a run that was not cost-capped or turn-limited, and an
+// accepted grade from that execution.
+func (s *Server) fixValidationVerdicts(baseline []db.Finding, ref, commit string) []fixValidationVerify {
 	if len(baseline) == 0 {
 		return nil
 	}
@@ -219,7 +229,7 @@ func (s *Server) fixValidationVerdicts(baseline []db.Finding, ref string) []fixV
 	}
 
 	var scans []db.Scan
-	if err := s.DB.Select("finding_id, status, report").
+	if err := s.DB.Select("id", "finding_id", "status", "commit", "run_number", "max_turns_hit", "cost_capped").
 		Where("finding_id IN ? AND skill_name = ? AND ref = ?", ids, verifySkillName, ref).
 		Order("id desc").
 		Find(&scans).Error; err != nil {
@@ -229,6 +239,8 @@ func (s *Server) fixValidationVerdicts(baseline []db.Finding, ref string) []fixV
 
 	seen := map[uint]bool{}
 	var out []fixValidationVerify
+	var eligibleScanIDs []uint
+	entryByScan := map[uint]int{}
 	for _, sc := range scans {
 		if sc.FindingID == nil || seen[*sc.FindingID] {
 			continue
@@ -236,11 +248,34 @@ func (s *Server) fixValidationVerdicts(baseline []db.Finding, ref string) []fixV
 		seen[*sc.FindingID] = true
 		status := verifyStatusPending
 		if sc.Status == db.ScanDone {
-			if st := parseVerifyStatus(sc.Report); st != "" {
-				status = st
+			status = verifyStatusUnverified
+			if commit != "" && sc.Commit == commit && sc.RunNumber > 0 && !sc.MaxTurnsHit && !sc.CostCapped {
+				eligibleScanIDs = append(eligibleScanIDs, sc.ID)
+				entryByScan[sc.ID] = len(out)
 			}
 		}
-		out = append(out, fixValidationVerify{FindingID: *sc.FindingID, Title: titleByID[*sc.FindingID], Status: status})
+		out = append(out, fixValidationVerify{
+			FindingID: *sc.FindingID, Title: titleByID[*sc.FindingID], Status: status,
+			ScanID: sc.ID, Commit: sc.Commit, RunNumber: sc.RunNumber,
+		})
+	}
+	if len(eligibleScanIDs) == 0 {
+		return out
+	}
+	// A non-nil score means the host accepted the rubric and control context.
+	// Use that record's verdict rather than the model's ungraded report status.
+	var graded []db.FindingVerification
+	if err := s.DB.Select("scan_id, finding_id, status, run_number").
+		Where("finding_id IN ? AND scan_id IN ? AND score IS NOT NULL", ids, eligibleScanIDs).
+		Where(map[string]any{"commit": commit}).
+		Find(&graded).Error; err != nil {
+		s.Log.Warn("fix-validation: load graded verdicts", "ref", ref, "err", err)
+		return out
+	}
+	for _, v := range graded {
+		if i, ok := entryByScan[v.ScanID]; ok && out[i].FindingID == v.FindingID && out[i].RunNumber == v.RunNumber {
+			out[i].Status = v.Status
+		}
 	}
 	return out
 }

@@ -158,15 +158,25 @@ func TestAutoComputeFixValidation_writesReport(t *testing.T) {
 	fx, done := validateFixSetup(t)
 	defer done()
 
-	anchor := db.Scan{RepositoryID: fx.repoID, Status: db.ScanDone, SkillName: deepDiveSkillName, Ref: "fix", BaselineScanID: &fx.baselineID}
+	anchor := db.Scan{RepositoryID: fx.repoID, Status: db.ScanDone, SkillName: deepDiveSkillName, Ref: "fix", Commit: "abc123", BaselineScanID: &fx.baselineID}
 	fx.s.DB.Create(&anchor)
-	// f1 survived (re-observed by the anchor), f2 resolved (not re-observed).
+	// f1 survived (re-observed by the anchor), f2 not seen (not re-observed).
+	if err := db.RecordFindingObservation(fx.s.DB, db.ObservationFromFinding(&anchor, &fx.f1)); err != nil {
+		t.Fatal(err)
+	}
 	fx.s.DB.Model(&db.Finding{}).Where("id = ?", fx.f1.ID).Update("last_seen_scan_id", anchor.ID)
 	fx.s.DB.Model(&db.Finding{}).Where("id = ?", fx.f2.ID).Update("last_seen_scan_id", fx.baselineID)
 	newF := db.Finding{ScanID: anchor.ID, RepositoryID: fx.repoID, Title: "new on fix ref", Severity: "Medium", Fingerprint: "fpnew"}
 	fx.s.DB.Create(&newF)
-	verifyScan := db.Scan{RepositoryID: fx.repoID, Status: db.ScanDone, SkillName: verifySkillName, Ref: "fix", FindingID: &fx.f1.ID, Report: `{"status":"confirmed"}`}
+	if err := db.RecordFindingObservation(fx.s.DB, db.ObservationFromFinding(&anchor, &newF)); err != nil {
+		t.Fatal(err)
+	}
+	verifyScan := db.Scan{RepositoryID: fx.repoID, Status: db.ScanDone, SkillName: verifySkillName, RunNumber: 1, Ref: "fix", Commit: anchor.Commit, FindingID: &fx.f1.ID, Report: `{"status":"confirmed"}`}
 	fx.s.DB.Create(&verifyScan)
+	score := 1.0
+	if err := fx.s.DB.Create(&db.FindingVerification{Commit: verifyScan.Commit, RunNumber: 1, ScanID: verifyScan.ID, FindingID: fx.f1.ID, Status: "confirmed", Score: &score, Report: verifyScan.Report}).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	fx.s.autoComputeFixValidation(&anchor)
 
@@ -196,7 +206,7 @@ func TestAutoComputeFixValidation_pendingVerify(t *testing.T) {
 	anchor := db.Scan{RepositoryID: fx.repoID, Status: db.ScanDone, SkillName: deepDiveSkillName, Ref: "fix", BaselineScanID: &fx.baselineID}
 	fx.s.DB.Create(&anchor)
 	// A verify against the fix ref that has not finished yet.
-	verifyScan := db.Scan{RepositoryID: fx.repoID, Status: db.ScanRunning, SkillName: verifySkillName, Ref: "fix", FindingID: &fx.f1.ID}
+	verifyScan := db.Scan{RepositoryID: fx.repoID, Status: db.ScanRunning, SkillName: verifySkillName, RunNumber: 1, Ref: "fix", FindingID: &fx.f1.ID}
 	fx.s.DB.Create(&verifyScan)
 
 	fx.s.autoComputeFixValidation(&anchor)
@@ -209,6 +219,101 @@ func TestAutoComputeFixValidation_pendingVerify(t *testing.T) {
 	}
 	if len(rep.Verify) != 1 || rep.Verify[0].Status != verifyStatusPending {
 		t.Fatalf("verify = %+v, want [f1 pending]", rep.Verify)
+	}
+}
+
+type fixValidationCommitCase struct {
+	name         string
+	anchorCommit string
+	verifyCommit string
+	scanStatus   db.ScanStatus
+	verdict      string
+	wantStatus   string
+}
+
+func TestAutoComputeFixValidation_requiresMatchingCommit(t *testing.T) {
+	const commitA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const commitB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	for _, tc := range []fixValidationCommitCase{
+		{"branch advanced", commitB, commitA, db.ScanDone, "fixed", "unverified"},
+		{"older failure", commitB, commitA, db.ScanDone, "confirmed", "unverified"},
+		{"same commit", commitA, commitA, db.ScanDone, "fixed", "fixed"},
+		{"unknown verify commit", commitB, "", db.ScanDone, "fixed", "unverified"},
+		{"unknown anchor commit", "", commitA, db.ScanDone, "fixed", "unverified"},
+		{"both commits unknown", "", "", db.ScanDone, "fixed", "unverified"},
+		{"latest still running", commitB, "", db.ScanRunning, "fixed", "pending"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			checkFixValidationCommit(t, tc)
+		})
+	}
+}
+
+func checkFixValidationCommit(t *testing.T, tc fixValidationCommitCase) {
+	t.Helper()
+	fx, done := validateFixSetup(t)
+	defer done()
+	anchor := db.Scan{RepositoryID: fx.repoID, Status: db.ScanDone, SkillName: deepDiveSkillName,
+		Ref: "candidate", Commit: tc.anchorCommit, BaselineScanID: &fx.baselineID}
+	if err := fx.s.DB.Create(&anchor).Error; err != nil {
+		t.Fatal(err)
+	}
+	// The latest attempt must not fall back to an older matching verdict.
+	older := db.Scan{RepositoryID: fx.repoID, Status: db.ScanDone, SkillName: verifySkillName, RunNumber: 1,
+		Ref: "candidate", Commit: tc.anchorCommit, FindingID: &fx.f1.ID, Report: `{"status":"confirmed"}`}
+	if err := fx.s.DB.Create(&older).Error; err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(map[string]string{"status": tc.verdict})
+	if err != nil {
+		t.Fatal(err)
+	}
+	verify := db.Scan{RepositoryID: fx.repoID, Status: tc.scanStatus, SkillName: verifySkillName, RunNumber: 1,
+		Ref: "candidate", Commit: tc.verifyCommit, FindingID: &fx.f1.ID, Report: string(raw)}
+	if err := fx.s.DB.Create(&verify).Error; err != nil {
+		t.Fatal(err)
+	}
+	score := 1.0
+	for _, scan := range []db.Scan{older, verify} {
+		if scan.Status != db.ScanDone {
+			continue
+		}
+		status := tc.verdict
+		if scan.ID == older.ID {
+			status = "confirmed"
+		}
+		if err := fx.s.DB.Create(&db.FindingVerification{Commit: scan.Commit, RunNumber: 1, ScanID: scan.ID, FindingID: fx.f1.ID, Status: status, Score: &score, Report: scan.Report}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fx.s.autoComputeFixValidation(&anchor)
+
+	var saved db.Scan
+	if err := fx.s.DB.First(&saved, anchor.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	var report struct {
+		FixCommit string `json:"fix_commit"`
+		Verify    []struct {
+			FindingID uint   `json:"finding_id"`
+			Status    string `json:"status"`
+			ScanID    uint   `json:"verify_scan_id"`
+			Commit    string `json:"verify_commit"`
+		} `json:"verify"`
+	}
+	if err := json.Unmarshal([]byte(saved.Report), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.FixCommit != tc.anchorCommit || len(report.Verify) != 1 {
+		t.Fatalf("unexpected report: %s", saved.Report)
+	}
+	v := report.Verify[0]
+	if v.Status != tc.wantStatus {
+		t.Errorf("status = %q, want %q; anchor commit %q, verify commit %q", v.Status, tc.wantStatus, tc.anchorCommit, tc.verifyCommit)
+	}
+	if v.FindingID != fx.f1.ID || v.ScanID != verify.ID || v.Commit != tc.verifyCommit {
+		t.Errorf("verification provenance = %+v, want finding %d, scan %d, commit %q", v, fx.f1.ID, verify.ID, tc.verifyCommit)
 	}
 }
 
@@ -282,5 +387,242 @@ func TestParseFindingIDs(t *testing.T) {
 	}
 	if _, err := parseFindingIDs(form("notanumber")); err == nil {
 		t.Fatal("non-numeric finding id: expected error")
+	}
+}
+
+// Realize the database interleaving after the anchor observes f1 and before
+// its report is assembled. This is deterministic; it does not race workers.
+func TestAutoComputeFixValidation_keepsAnchorObservation(t *testing.T) {
+	fx, done := validateFixSetup(t)
+	defer done()
+	anchor := db.Scan{RepositoryID: fx.repoID, Status: db.ScanDone, SkillName: deepDiveSkillName,
+		Ref: "candidate", Commit: "B", BaselineScanID: &fx.baselineID}
+	sibling := db.Scan{RepositoryID: fx.repoID, Status: db.ScanDone, SkillName: deepDiveSkillName,
+		Ref: "main", Commit: "C"}
+	for _, scan := range []*db.Scan{&anchor, &sibling} {
+		if err := fx.s.DB.Create(scan).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.RecordFindingObservation(fx.s.DB, db.ObservationFromFinding(scan, &fx.f1)); err != nil {
+			t.Fatal(err)
+		}
+		if err := fx.s.DB.Model(&db.Finding{}).Where("id = ?", fx.f1.ID).Update("last_seen_scan_id", scan.ID).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A sibling-only observation of f2 must not count for this anchor.
+	if err := db.RecordFindingObservation(fx.s.DB, db.ObservationFromFinding(&sibling, &fx.f2)); err != nil {
+		t.Fatal(err)
+	}
+	fx.s.autoComputeFixValidation(&anchor)
+	var saved db.Scan
+	if err := fx.s.DB.First(&saved, anchor.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("OBSERVATION_REPORT %s", saved.Report)
+	var report fixValidationReport
+	if err := json.Unmarshal([]byte(saved.Report), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Counts.Surviving != 1 || len(report.Surviving) != 1 || report.Surviving[0].FindingID != fx.f1.ID {
+		t.Errorf("anchor observation lost after another scan: %s", saved.Report)
+	}
+	if report.Counts.Resolved != 1 || len(report.Resolved) != 1 || report.Resolved[0].FindingID != fx.f2.ID {
+		t.Errorf("sibling-only finding must remain resolved: %s", saved.Report)
+	}
+}
+
+func TestFixValidationVerdicts_requiresAcceptedGrading(t *testing.T) {
+	zero := 0.0
+	for _, tc := range []struct {
+		name                 string
+		hasGrade             bool
+		score                *float64
+		gradedStatus         string
+		maxTurns, costCapped bool
+		want                 string
+	}{
+		{name: "missing grading record", want: "unverified"},
+		{name: "rejected grading", hasGrade: true, gradedStatus: "fixed", want: "unverified"},
+		{name: "accepted zero score", hasGrade: true, score: &zero, gradedStatus: "fixed", want: "fixed"},
+		{name: "accepted verdict instead of raw status", hasGrade: true, score: &zero, gradedStatus: "confirmed", want: "confirmed"},
+		{name: "turn-limited", hasGrade: true, score: &zero, gradedStatus: "fixed", maxTurns: true, want: "unverified"},
+		{name: "cost-capped", hasGrade: true, score: &zero, gradedStatus: "fixed", costCapped: true, want: "unverified"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx, done := validateFixSetup(t)
+			defer done()
+			older := db.Scan{RepositoryID: fx.repoID, FindingID: &fx.f1.ID, SkillName: verifySkillName, RunNumber: 1,
+				Ref: "candidate", Commit: "same", Status: db.ScanDone, Report: `{"status":"fixed"}`}
+			if err := fx.s.DB.Create(&older).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := fx.s.DB.Create(&db.FindingVerification{Commit: older.Commit, RunNumber: 1, ScanID: older.ID, FindingID: fx.f1.ID, Status: "fixed", Score: &zero, Report: older.Report}).Error; err != nil {
+				t.Fatal(err)
+			}
+			latest := db.Scan{RepositoryID: fx.repoID, FindingID: &fx.f1.ID, SkillName: verifySkillName, RunNumber: 1,
+				Ref: "candidate", Commit: "same", Status: db.ScanDone, Report: `{"status":"fixed"}`,
+				MaxTurnsHit: tc.maxTurns, CostCapped: tc.costCapped}
+			if err := fx.s.DB.Create(&latest).Error; err != nil {
+				t.Fatal(err)
+			}
+			if tc.hasGrade {
+				// Constructed record: the disagreement case checks which source wins.
+				if err := fx.s.DB.Create(&db.FindingVerification{Commit: latest.Commit, RunNumber: 1, ScanID: latest.ID, FindingID: fx.f1.ID, Status: tc.gradedStatus, Score: tc.score, Report: latest.Report}).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			got := fx.s.fixValidationVerdicts([]db.Finding{fx.f1}, "candidate", "same")
+			if len(got) != 1 || got[0].ScanID != latest.ID || got[0].Status != tc.want {
+				t.Fatalf("verdict = %+v, want latest scan %d status %s", got, latest.ID, tc.want)
+			}
+		})
+	}
+}
+
+func TestFixValidationVerdicts_requiresMatchingExecution(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		scanRun, gradeRun uint
+		gradeCommit, want string
+	}{
+		{"matching execution", 1, 1, "current", "fixed"},
+		{"prior execution", 2, 1, "current", "unverified"},
+		{"unknown execution", 0, 0, "current", "unverified"},
+		{"prior commit", 1, 1, "older", "unverified"},
+		{"unknown grading commit", 1, 1, "", "unverified"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx, done := validateFixSetup(t)
+			defer done()
+			scan := db.Scan{RepositoryID: fx.repoID, FindingID: &fx.f1.ID, SkillName: verifySkillName,
+				Ref: "candidate", Commit: "current", RunNumber: tc.scanRun, Status: db.ScanDone}
+			if err := fx.s.DB.Create(&scan).Error; err != nil {
+				t.Fatal(err)
+			}
+			score := 0.0
+			grade := db.FindingVerification{ScanID: scan.ID, FindingID: fx.f1.ID, Commit: tc.gradeCommit,
+				RunNumber: tc.gradeRun, Status: "fixed", Score: &score, Report: `{"status":"fixed"}`}
+			if err := fx.s.DB.Create(&grade).Error; err != nil {
+				t.Fatal(err)
+			}
+			got := fx.s.fixValidationVerdicts([]db.Finding{fx.f1}, "candidate", "current")
+			if len(got) != 1 || got[0].Status != tc.want {
+				t.Fatalf("verdict=%+v, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// Deliberately construct a wrong-subject row to test the batched subject guard.
+func TestFixValidationVerdicts_keepsGradingSubjectsSeparate(t *testing.T) {
+	fx, done := validateFixSetup(t)
+	defer done()
+	f1Scan := db.Scan{RepositoryID: fx.repoID, FindingID: &fx.f1.ID, SkillName: verifySkillName,
+		Ref: "candidate", Commit: "current", RunNumber: 1, Status: db.ScanDone}
+	f2Scan := f1Scan
+	f2Scan.FindingID = &fx.f2.ID
+	for _, scan := range []*db.Scan{&f1Scan, &f2Scan} {
+		if err := fx.s.DB.Create(scan).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	score := 0.0
+	for _, grade := range []db.FindingVerification{
+		{ScanID: f1Scan.ID, FindingID: fx.f1.ID, Commit: "current", RunNumber: 1, Status: "fixed", Score: &score},
+		{ScanID: f2Scan.ID, FindingID: fx.f2.ID, Commit: "current", RunNumber: 1, Status: "fixed"},
+		{ScanID: f2Scan.ID, FindingID: fx.f1.ID, Commit: "current", RunNumber: 1, Status: "fixed", Score: &score},
+	} {
+		if err := fx.s.DB.Create(&grade).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := fx.s.fixValidationVerdicts([]db.Finding{fx.f1, fx.f2}, "candidate", "current")
+	if len(got) != 2 {
+		t.Fatalf("verdicts=%+v, want two findings", got)
+	}
+	for _, v := range got {
+		want := "unverified"
+		if v.FindingID == fx.f1.ID {
+			want = "fixed"
+		}
+		if v.Status != want {
+			t.Fatalf("verdicts=%+v, finding %d wants %s", got, v.FindingID, want)
+		}
+	}
+}
+
+func TestAutoComputeFixValidation_ignoresPriorRevisionObservation(t *testing.T) {
+	fx, done := validateFixSetup(t)
+	defer done()
+	anchor := db.Scan{RepositoryID: fx.repoID, SkillName: deepDiveSkillName, Status: db.ScanDone,
+		Commit: "B", Ref: "candidate", BaselineScanID: &fx.baselineID}
+	if err := fx.s.DB.Create(&anchor).Error; err != nil {
+		t.Fatal(err)
+	}
+	prior := anchor
+	prior.Commit = "A"
+	if err := db.RecordFindingObservation(fx.s.DB, db.ObservationFromFinding(&prior, &fx.f1)); err != nil {
+		t.Fatal(err)
+	}
+	fx.s.autoComputeFixValidation(&anchor)
+	var saved db.Scan
+	if err := fx.s.DB.First(&saved, anchor.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	var report fixValidationReport
+	if err := json.Unmarshal([]byte(saved.Report), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Counts.Surviving != 0 || report.Counts.Resolved != 2 {
+		t.Fatalf("prior revision observation applied to B: %s", saved.Report)
+	}
+}
+
+func TestAutoComputeFixValidation_newFindingsMatchAnchorRevision(t *testing.T) {
+	fx, done := validateFixSetup(t)
+	defer done()
+	anchor := db.Scan{RepositoryID: fx.repoID, SkillName: deepDiveSkillName, Status: db.ScanDone,
+		Commit: "B", Ref: "candidate", BaselineScanID: &fx.baselineID}
+	if err := fx.s.DB.Create(&anchor).Error; err != nil {
+		t.Fatal(err)
+	}
+	stale := db.Finding{ScanID: anchor.ID, RepositoryID: fx.repoID, Commit: "A", Title: "only at A", Fingerprint: "new-stale"}
+	reobserved := db.Finding{ScanID: anchor.ID, RepositoryID: fx.repoID, Commit: "A", Title: "also at B", Fingerprint: "new-reobserved"}
+	fresh := db.Finding{ScanID: anchor.ID, RepositoryID: fx.repoID, Commit: "B", Title: "first at B", Fingerprint: "new-fresh"}
+	prior := anchor
+	prior.Commit = "A"
+	for _, f := range []*db.Finding{&stale, &reobserved, &fresh} {
+		if err := fx.s.DB.Create(f).Error; err != nil {
+			t.Fatal(err)
+		}
+		scan := &prior
+		if f == &fresh {
+			scan = &anchor
+		}
+		if err := db.RecordFindingObservation(fx.s.DB, db.ObservationFromFinding(scan, f)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.RecordFindingObservation(fx.s.DB, db.ObservationFromFinding(&anchor, &reobserved)); err != nil {
+		t.Fatal(err)
+	}
+	fx.s.autoComputeFixValidation(&anchor)
+	var saved db.Scan
+	if err := fx.s.DB.First(&saved, anchor.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("NEW_FINDINGS_REPORT %s", saved.Report)
+	var report fixValidationReport
+	if err := json.Unmarshal([]byte(saved.Report), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Counts.New != 2 || len(report.New) != 2 {
+		t.Fatalf("stale A finding reported at B: %s", saved.Report)
+	}
+	for _, f := range report.New {
+		if f.FindingID != reobserved.ID && f.FindingID != fresh.ID {
+			t.Fatalf("wrong new finding at B: %+v", f)
+		}
 	}
 }

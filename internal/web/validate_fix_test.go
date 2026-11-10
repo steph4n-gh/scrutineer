@@ -17,7 +17,7 @@ func TestClassifyFixValidation(t *testing.T) {
 	}
 	fixNew := []db.Finding{{ID: 4, Fingerprint: "fp-new", ScanID: fixID}}
 
-	resolved, surviving, newF := classifyFixValidation(baseline, fixNew, fixID)
+	resolved, surviving, newF := classifyFixValidation(baseline, fixNew, []uint{1})
 
 	if len(surviving) != 1 || surviving[0].ID != 1 {
 		t.Fatalf("surviving = %+v, want [id 1]", surviving)
@@ -31,9 +31,9 @@ func TestClassifyFixValidation(t *testing.T) {
 }
 
 func TestClassifyFixValidation_empty(t *testing.T) {
-	resolved, surviving, newF := classifyFixValidation(nil, nil, 20)
+	resolved, surviving, newF := classifyFixValidation(nil, nil, nil)
 	if len(resolved) != 0 || len(surviving) != 0 || len(newF) != 0 {
-		t.Fatalf("expected all empty, got r=%d s=%d n=%d", len(resolved), len(surviving), len(newF))
+		t.Fatalf("expected all empty, got resolved=%d s=%d n=%d", len(resolved), len(surviving), len(newF))
 	}
 }
 
@@ -51,7 +51,7 @@ func TestBuildFixValidationReport(t *testing.T) {
 		{FindingID: 2, Title: "critical survivor", Status: "confirmed"},
 	}
 
-	rep := buildFixValidationReport(fixScan, baselineID, baseline, fixNew, verify)
+	rep := buildFixValidationReport(fixScan, baselineID, baseline, fixNew, []uint{1, 2}, verify)
 
 	if rep.FixRef != "fix-branch" || rep.Skill != "security-deep-dive" ||
 		rep.BaselineScanID != baselineID || rep.FixScanID != fixID || rep.FixCommit != "abc123" {
@@ -71,7 +71,7 @@ func TestBuildFixValidationReport(t *testing.T) {
 }
 
 func TestBuildFixValidationReport_emptyBucketsMarshalAsArrays(t *testing.T) {
-	rep := buildFixValidationReport(db.Scan{ID: 20}, 10, nil, nil, nil)
+	rep := buildFixValidationReport(db.Scan{ID: 20}, 10, nil, nil, nil, nil)
 	b, err := json.Marshal(rep)
 	if err != nil {
 		t.Fatal(err)
@@ -83,14 +83,33 @@ func TestBuildFixValidationReport_emptyBucketsMarshalAsArrays(t *testing.T) {
 	}
 }
 
-func TestParseVerifyStatus(t *testing.T) {
-	if got := parseVerifyStatus(`{"status":"fixed","notes":"no longer triggers"}`); got != "fixed" {
-		t.Fatalf("valid report: got %q, want fixed", got)
-	}
-	if got := parseVerifyStatus(`not json at all`); got != "" {
-		t.Fatalf("bad json: got %q, want empty", got)
-	}
-	if got := parseVerifyStatus(``); got != "" {
-		t.Fatalf("empty report: got %q, want empty", got)
+func TestBuildFixValidationReport_keepsFingerprintDiffSeparateFromVerification(t *testing.T) {
+	for _, status := range []string{"unverified", "fixed"} {
+		t.Run(status, func(t *testing.T) {
+			scan := db.Scan{ID: 20, Commit: "candidate-commit"}
+			baseline := []db.Finding{{ID: 1, ScanID: 10, LastSeenScanID: 10, Title: "missed finding"}}
+			verify := []fixValidationVerify{{FindingID: 1, Status: status, ScanID: 30, Commit: scan.Commit}}
+			raw, err := json.Marshal(buildFixValidationReport(scan, 10, baseline, nil, nil, verify))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var report struct {
+				Counts   map[string]int         `json:"counts"`
+				Resolved []fixValidationFinding `json:"resolved"`
+				Verify   []fixValidationVerify  `json:"verify"`
+			}
+			if err := json.Unmarshal(raw, &report); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(raw), `"not_seen"`) {
+				t.Errorf("fingerprint bucket keys must remain compatible: %s", raw)
+			}
+			if report.Counts["resolved"] != 1 || len(report.Resolved) != 1 || report.Resolved[0].FindingID != 1 {
+				t.Errorf("missing resolved observation: %s", raw)
+			}
+			if len(report.Verify) != 1 || report.Verify[0].Status != status {
+				t.Errorf("verification must remain a separate result: %s", raw)
+			}
+		})
 	}
 }

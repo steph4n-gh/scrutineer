@@ -1,7 +1,6 @@
 package web
 
 import (
-	"encoding/json"
 	"sort"
 
 	"scrutineer/internal/db"
@@ -43,29 +42,39 @@ type fixValidationFinding struct {
 
 // fixValidationVerify is one targeted finding's reproduction-level verdict
 // against the fix ref. Status mirrors the verify skill enum (confirmed, fixed,
-// inconclusive, deferred); "pending" means the verify scan had not finished
-// when the report was assembled.
+// inconclusive, deferred, not_attempted). "unverified" means a completed scan
+// lacks a matching known commit or accepted grade, or was cost-capped or turn-limited.
+// "pending" means the selected scan is not done.
 type fixValidationVerify struct {
 	FindingID uint   `json:"finding_id"`
 	Title     string `json:"title"`
 	Status    string `json:"status"`
+	ScanID    uint   `json:"verify_scan_id"`
+	Commit    string `json:"verify_commit,omitempty"`
+	RunNumber uint   `json:"verify_run_number,omitempty"`
 }
 
-const verifyStatusPending = "pending"
+const (
+	verifyStatusPending    = "pending"
+	verifyStatusUnverified = "unverified"
+)
 
 // classifyFixValidation splits the baseline scan's findings into the ones the
 // fix-ref re-scan no longer reports (resolved) and the ones it still reports
 // (surviving), and passes through the re-scan's brand-new findings (new). It
-// keys off the re-observation bookkeeping the findings parser already
-// maintains rather than diffing two raw sets: re-observing a finding merges
-// into its existing row and bumps LastSeenScanID to the observing scan, so a
-// baseline finding whose LastSeenScanID is the fix scan survived, and one with
-// any other value was missed (resolved). New findings are the rows the fix
-// scan created in its own right — a fresh fingerprint for the repository.
+// uses the fix scan's own observation IDs; another scan can overwrite the
+// canonical finding's LastSeenScanID without changing these observations.
+// Absence alone does not establish a fix; the finding-scoped verify verdict
+// is separate. New findings are rows created by the fix scan — a fresh
+// fingerprint for the repository.
 // Pure so the classification is unit-testable without a worker run.
-func classifyFixValidation(baseline, fixNew []db.Finding, fixScanID uint) (resolved, surviving, newFindings []db.Finding) {
+func classifyFixValidation(baseline, fixNew []db.Finding, observedIDs []uint) (resolved, surviving, newFindings []db.Finding) {
+	observed := make(map[uint]bool, len(observedIDs))
+	for _, id := range observedIDs {
+		observed[id] = true
+	}
 	for _, f := range baseline {
-		if f.LastSeenScanID == fixScanID {
+		if observed[f.ID] {
 			surviving = append(surviving, f)
 		} else {
 			resolved = append(resolved, f)
@@ -77,8 +86,8 @@ func classifyFixValidation(baseline, fixNew []db.Finding, fixScanID uint) (resol
 // buildFixValidationReport assembles the report struct from the already-loaded
 // inputs. Kept pure (no DB access) so the composition and ordering are
 // testable; the callback in validate_fix_enqueue.go does the loading.
-func buildFixValidationReport(fixScan db.Scan, baselineScanID uint, baseline, fixNew []db.Finding, verify []fixValidationVerify) fixValidationReport {
-	resolved, surviving, newFindings := classifyFixValidation(baseline, fixNew, fixScan.ID)
+func buildFixValidationReport(fixScan db.Scan, baselineScanID uint, baseline, fixNew []db.Finding, observedIDs []uint, verify []fixValidationVerify) fixValidationReport {
+	resolved, surviving, newFindings := classifyFixValidation(baseline, fixNew, observedIDs)
 	if verify == nil {
 		verify = []fixValidationVerify{}
 	}
@@ -129,17 +138,4 @@ func toValidationFindings(fs []db.Finding) []fixValidationFinding {
 
 func sortVerify(v []fixValidationVerify) {
 	sort.Slice(v, func(i, j int) bool { return v[i].FindingID < v[j].FindingID })
-}
-
-// parseVerifyStatus pulls the verify skill's status enum out of a verify
-// scan's report.json. Empty when the report is absent or unparseable, which
-// the caller maps to a pending verdict.
-func parseVerifyStatus(report string) string {
-	var v struct {
-		Status string `json:"status"`
-	}
-	if json.Unmarshal([]byte(report), &v) != nil {
-		return ""
-	}
-	return v.Status
 }

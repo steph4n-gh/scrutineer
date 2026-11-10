@@ -147,7 +147,7 @@ this table instead of reparsing notes or reports.
 
 ## scans
 
-One row per skill execution or external import. `skill_name` / `skill_version` pin which skill ran; for imports `skill_name` records the originating tool.
+One row per skill scan or external import. A resume reuses the row and advances `run_number`. `skill_name` / `skill_version` pin which skill ran; for imports `skill_name` records the originating tool.
 
 | Column | Type | Notes |
 |--------|------|-------|
@@ -188,7 +188,8 @@ One row per skill execution or external import. `skill_name` / `skill_version` p
 | provider | text | Provider prefix selected from an OpenCode model id, such as `groq` or `kiro`. Empty for other backends. |
 | runner_image | text | Provider base image selected for the scan, before the language profile is layered on it. |
 | runner_image_digest | text | Locally resolved registry digest, or immutable local image id when the provider image has no registry digest. |
-| commit | text | Git HEAD at scan time. |
+| commit | text | Git HEAD at scan time. Cleared on each worker claim until that execution resolves its checkout. |
+| run_number | integer | Advances atomically on each successful worker claim, including resume of the same scan row. Zero means no recorded execution identity. |
 | started_at | datetime | |
 | finished_at | datetime | |
 | cost_usd | real | Cost charged to this scan. Repeated cumulative totals add nothing, and resumed sessions subtract previously recorded spend. Backends without reported costs use token-price estimates. |
@@ -210,6 +211,12 @@ One row per skill execution or external import. `skill_name` / `skill_version` p
 | findings_count | integer | Denormalised count of findings parsed from the report. |
 | created_at | datetime | |
 | updated_at | datetime | |
+
+Fix-validation reports retain the `resolved`/`surviving`/`new` fingerprint buckets, separate from the reproduction verdicts. Bucket membership uses the anchor scan's `finding_observations` at its commit rather than the finding's mutable `last_seen_scan_id`. The `new` bucket also requires an observation at that commit, excluding findings left only by an earlier revision of a resumed anchor.
+
+Each verification entry records `verify_scan_id` and, when known, `verify_commit` and `verify_run_number`. A completed scan supplies a verdict only when it matches the anchor's known `fix_commit`, was not cost-capped or turn-limited, and has an accepted `finding_verifications` grade for the same finding, scan, commit and positive run number. A non-null score, including zero, identifies an accepted grade. The report uses that grade's verdict. Otherwise the completed scan is `unverified`; a scan not marked `done` is `pending`.
+
+Legacy grades with unknown execution identity and grades retained from an earlier execution remain readable but cannot authorize a new validation verdict. Resuming a scan after its immutable grade was written also yields `unverified`, even at the same commit. Run a fresh verification scan to obtain a new grade. Previously stored validation reports remain unchanged.
 
 ## scan_preflight_receipts
 
@@ -445,6 +452,8 @@ Append-only grading records produced by finding-scoped `verify` scans. The compl
 | id | integer PK | |
 | finding_id | integer FK | References `findings.id`; cascade delete. Unique with `scan_id`. |
 | scan_id | integer | The verify scan that produced this record. Unique with `finding_id`. |
+| commit | text | Code revision when this immutable grading record was created. Empty for legacy or unknown provenance. |
+| run_number | integer | Execution number copied from the scan at grading time. Must be positive and match the selected scan run before fix validation applies its verdict. Legacy records remain zero. |
 | status | text | `confirmed`, `fixed`, `inconclusive`, `deferred`, or `not_attempted`. |
 | score | real, nullable | Fraction of the five rubric criteria that passed, from `0.0` to `1.0`. Null for legacy pre-rubric reports and reports that remain internally inconsistent after repair. |
 | report | text | Complete structured JSON report, including the attack-tree goal, evidenced path nodes, reachability verdict, concrete blockers, typed severity prerequisites, three attempts, five scored criteria, and per-control bypass assessments. Reports written before attack-tree, control-bypass or prerequisite support remain readable. |

@@ -1341,6 +1341,8 @@ func (w *Worker) recordVerifyOutput(scan *db.Scan, f db.Finding, record verifyRe
 		row := db.FindingVerification{
 			FindingID: f.ID,
 			ScanID:    scan.ID,
+			Commit:    scan.Commit,
+			RunNumber: scan.RunNumber,
 			Status:    record.result.Status,
 			Score:     record.score,
 			Report:    record.report,

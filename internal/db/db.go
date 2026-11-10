@@ -267,6 +267,9 @@ type Scan struct {
 	// would race with a newer patch run and could validate the wrong diff.
 	RemediationAttemptID *uint  `gorm:"index"`
 	APIToken             string `gorm:"index"`
+	// RunNumber advances on each successful worker claim, including resumes
+	// of this same scan row. Zero means no recorded execution identity.
+	RunNumber uint `gorm:"not null;default:0"`
 
 	// StatusPriority is a denormalised sort key so the scans index can use
 	// an index instead of evaluating a CASE on every row. 0 = running,
@@ -1366,9 +1369,13 @@ type FindingReview struct {
 // for legacy reports and rubric reports that remain internally inconsistent
 // after the repair attempt.
 type FindingVerification struct {
-	ID        uint   `gorm:"primarykey"`
-	FindingID uint   `gorm:"index;not null;uniqueIndex:idx_finding_verification_scan,priority:1"`
-	ScanID    uint   `gorm:"not null;uniqueIndex:idx_finding_verification_scan,priority:2"`
+	ID        uint `gorm:"primarykey"`
+	FindingID uint `gorm:"index;not null;uniqueIndex:idx_finding_verification_scan,priority:1"`
+	ScanID    uint `gorm:"not null;uniqueIndex:idx_finding_verification_scan,priority:2"`
+	// Commit and RunNumber identify the execution that produced this record;
+	// resuming its scan must not make this immutable grade apply to a new run.
+	Commit    string
+	RunNumber uint   `gorm:"not null;default:0"`
 	Status    string `gorm:"index;not null"`
 	Score     *float64
 	Report    string `gorm:"type:text;not null"`

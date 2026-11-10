@@ -26,7 +26,7 @@ func (backendRunner) SkillDir(workRoot, name string) string {
 
 func (b backendRunner) Backend() string { return b.backend }
 
-func newRecipeWorker(t *testing.T, threatModel, scanConfig, backend string) (*Worker, db.Scan, uint) {
+func newRecipeWorker(t *testing.T, threatModel, scanConfig string) (*Worker, db.Scan, uint) {
 	t.Helper()
 	gdb := dbtest.Open(t)
 	repo := db.Repository{
@@ -60,7 +60,7 @@ func newRecipeWorker(t *testing.T, threatModel, scanConfig, backend string) (*Wo
 		DB:             gdb,
 		Log:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		DataDir:        t.TempDir(),
-		Runner:         backendRunner{backend: backend},
+		Runner:         backendRunner{backend: "claude"},
 		PrepareRepoSrc: stubPrepareRepoSrc,
 	}
 	return w, scan, repo.ID
@@ -83,7 +83,7 @@ func recipeOf(t *testing.T, w *Worker, scanID uint) ScanRecipe {
 }
 
 func TestStartScan_writesRecipeSnapshotAtClaim(t *testing.T) {
-	w, scan, _ := newRecipeWorker(t, "threats: sql injection", "paths:\n  - core", "claude")
+	w, scan, _ := newRecipeWorker(t, "threats: sql injection", "paths:\n  - core")
 	if err := w.startScan(&scan); err != nil {
 		t.Fatalf("startScan: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestStartScan_writesRecipeSnapshotAtClaim(t *testing.T) {
 // the sharpest case: it is re-resolved on every claim, so a -backend switch
 // across the pause would silently restamp the original recipe.
 func TestStartScan_recipeSurvivesAPausedScanResuming(t *testing.T) {
-	w, scan, repoID := newRecipeWorker(t, "threats: sql injection", "paths:\n  - core", "claude")
+	w, scan, repoID := newRecipeWorker(t, "threats: sql injection", "paths:\n  - core")
 	if err := w.startScan(&scan); err != nil {
 		t.Fatalf("first claim: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestStartScan_recipeSurvivesAPausedScanResuming(t *testing.T) {
 // premise: if the commit ever becomes known at claim time, this test fails and
 // the omission should be revisited.
 func TestStartScan_commitIsNotKnownAtClaimTime(t *testing.T) {
-	w, scan, _ := newRecipeWorker(t, "", "", "claude")
+	w, scan, _ := newRecipeWorker(t, "", "")
 	if err := w.startScan(&scan); err != nil {
 		t.Fatalf("startScan: %v", err)
 	}
